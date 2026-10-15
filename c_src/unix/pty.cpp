@@ -659,6 +659,7 @@ pty_pipesocket_fn(void *data) {
 
   int fd = pipesocket->fd;
   int activity;
+  int read_error = 0;
 
   while (!pipesocket->fd_closed) {
     fd_set readfds;
@@ -670,6 +671,7 @@ pty_pipesocket_fn(void *data) {
       if (errno == EINTR) {
         continue;
       }
+      read_error = errno;
       pipesocket->fd_closed = true;
       close(fd);
       pty_kill_process_group(pipesocket->pid, SIGHUP);
@@ -691,6 +693,11 @@ pty_pipesocket_fn(void *data) {
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
           continue;
         }
+        read_error = errno;
+#if defined(__linux__)
+        // Linux reports PTY slave closure as EIO after buffered output drains.
+        if (read_error == EIO) read_error = 0;
+#endif
         pipesocket->fd_closed = true;
         close(fd);
         pty_kill_process_group(pipesocket->pid, SIGHUP);
@@ -713,6 +720,16 @@ pty_pipesocket_fn(void *data) {
       enif_free_env(msg_env);
     }
   }
+
+  // Publish from the reader, after its final data message. Process exit is
+  // published independently and does not imply that output has been drained.
+  ErlNifEnv *msg_env = enif_alloc_env();
+  ERL_NIF_TERM result = read_error == 0
+    ? nif::atom(msg_env, "eof")
+    : enif_make_tuple2(msg_env, nif::atom(msg_env, "error"), enif_make_int(msg_env, read_error));
+  enif_send(NULL, &pipesocket->process, msg_env, enif_make_tuple2(msg_env,
+    nif::atom(msg_env, "read_closed"), result));
+  enif_free_env(msg_env);
 
   enif_release_resource((void *)pipesocket);
   return nullptr;

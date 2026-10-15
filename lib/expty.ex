@@ -20,6 +20,7 @@ defmodule ExPTY do
     :pty,
     :on_data,
     :on_exit,
+    :on_read_closed,
     :echo?,
 
     # unix
@@ -57,6 +58,7 @@ defmodule ExPTY do
       cwd: Application.get_env(:expty, :cwd, Path.expand("~")),
       on_data: nil,
       on_exit: nil,
+      on_read_closed: nil,
       echo?: Application.get_env(:expty, :echo?, false),
       encoding: Application.get_env(:expty, :encoding, "utf-8"),
       handle_flow_control: Application.get_env(:expty, :handle_flow_control, false),
@@ -176,6 +178,17 @@ defmodule ExPTY do
     The return value of this callback function is ignored.
 
   ##### Unix-specific Keyword Parameters
+  - `on_read_closed`: `(module(), pid(), :eof | {:error, integer()} -> term()) | module()`
+
+    Called once after the Unix reader's final output callback. A clean PTY
+    closure reports `:eof`; an unexpected read or select failure reports its
+    POSIX error number. A module callback must export `on_read_closed/3`.
+    Defaults to `nil`. This callback is not supported on Windows.
+
+    Process exit and output completion are separate events. A descendant can
+    keep the PTY open after the spawned process exits; applications waiting for
+    both events must bound that wait and handle failure explicitly.
+
   - `encoding`: `String.t()`
 
     Defaults to `utf-8`. This keyword parameter will probably be removed in the first release.
@@ -361,6 +374,7 @@ defmodule ExPTY do
 
     on_data = normalize_callback(options[:on_data], :on_data, 3)
     on_exit = normalize_callback(options[:on_exit], :on_exit, 4)
+    on_read_closed = normalize_callback(options[:on_read_closed], :on_read_closed, 3)
 
     init_pack =
       case :os.type() do
@@ -422,7 +436,8 @@ defmodule ExPTY do
             flow_control_pause,
             flow_control_resume,
             on_data,
-            on_exit
+            on_exit,
+            on_read_closed
           }
 
         {os_type = :win32, _} ->
@@ -459,7 +474,7 @@ defmodule ExPTY do
         state =
           {os_type = :unix, file, args, env, cwd, cols, rows, ibaudrate, obaudrate, uid, gid,
            is_utf8, close_fds, echo?, helper_path, handle_flow_control, flow_control_pause,
-           flow_control_resume, on_data, on_exit}
+           flow_control_resume, on_data, on_exit, on_read_closed}
       ) do
     ret =
       ExPTY.Nif.spawn_unix(
@@ -493,6 +508,7 @@ defmodule ExPTY do
            flow_control_resume: flow_control_resume,
            on_data: on_data,
            on_exit: on_exit,
+           on_read_closed: on_read_closed,
            echo?: echo?
          }}
 
@@ -689,6 +705,17 @@ defmodule ExPTY do
 
       _ ->
         nil
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:read_closed, result}, %T{on_read_closed: callback} = state) do
+    case callback do
+      {:module, module} -> module.on_read_closed(__MODULE__, self(), result)
+      {:func, func} -> func.(__MODULE__, self(), result)
+      _ -> nil
     end
 
     {:noreply, state}
