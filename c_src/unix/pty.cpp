@@ -1,6 +1,8 @@
 #include <sys/types.h>
 #include "common.h"
 #include <new>
+#include <atomic>
+#include <chrono>
 #include <set>
 #include <string>
 #include <vector>
@@ -82,6 +84,8 @@
  * Structs
  */
 
+struct pty_pipesocket_;
+
 struct pty_baton {
   ErlNifEnv *env;
   ErlNifPid process;
@@ -89,12 +93,18 @@ struct pty_baton {
   int signal_code;
   pid_t pid;
   ErlNifTid tid;
+  ErlNifTid reader_tid;
+  pty_pipesocket_ *pipesocket;
+  int exit_pipe[2];
+  std::atomic<bool> child_exited{false};
+  std::atomic<bool> drain_failed{false};
 };
 
 typedef struct pty_pipesocket_ {
   int fd;
   pid_t pid;
   bool fd_closed;
+  pty_baton *baton;
 
   ErlNifEnv * env;
   ErlNifPid process;
@@ -142,24 +152,48 @@ class process_registry {
 public:
   explicit process_registry(ErlNifMutex *mutex) : mutex(mutex) {}
 
-  void insert(pid_t pid) {
+  void insert(pty_pipesocket *pipesocket) {
     nif_lock_guard lock(mutex);
-    pids.insert(pid);
+    children.insert(pipesocket);
   }
 
-  void erase(pid_t pid) {
+  bool erase(pty_pipesocket *pipesocket) {
     nif_lock_guard lock(mutex);
-    pids.erase(pid);
+    return children.erase(pipesocket) != 0;
   }
 
-  std::vector<pid_t> snapshot() {
+  int signal(pty_pipesocket *pipesocket, int signal) {
     nif_lock_guard lock(mutex);
-    return std::vector<pid_t>(pids.begin(), pids.end());
+    if (children.count(pipesocket) == 0) {
+      errno = ESRCH;
+      return -1;
+    }
+    return pty_kill_process_group(pipesocket->pid, signal);
+  }
+
+  int observe_exit(pty_pipesocket *pipesocket, siginfo_t *info) {
+    nif_lock_guard lock(mutex);
+    if (children.count(pipesocket) == 0) {
+      errno = ECHILD;
+      return -1;
+    }
+    // Nonblocking observation shares the signal/retirement lock. WNOWAIT
+    // reserves the original child identity until the reader has settled.
+    int result = waitid(P_PID, pipesocket->pid, info, WEXITED | WNOWAIT | WNOHANG);
+    if (result == -1 && errno == ECHILD) children.erase(pipesocket);
+    return result;
+  }
+
+  void terminate_all() {
+    nif_lock_guard lock(mutex);
+    for (pty_pipesocket *pipesocket : children) {
+      pty_kill_process_group(pipesocket->pid, SIGTERM);
+    }
   }
 
 private:
   ErlNifMutex *mutex;
-  std::set<pid_t> pids;
+  std::set<pty_pipesocket *> children;
 };
 
 // Native threads can outlive static destructors during library teardown.
@@ -175,9 +209,7 @@ static void __attribute__((destructor)) cleanup() {
   if (processes == nullptr || spawn_mutex == nullptr) return;
 
   nif_lock_guard lock(spawn_mutex);
-  for (pid_t pid : processes->snapshot()) {
-    pty_kill_process_group(pid, SIGTERM);
-  }
+  processes->terminate_all();
 }
 
 static ERL_NIF_TERM expty_spawn(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
@@ -445,10 +477,60 @@ static ERL_NIF_TERM expty_spawn(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
       baton->env = env;
       baton->process = process;
       baton->pid = pid;
+      baton->pipesocket = pipesocket;
 
-      processes->insert(pid);
-      enif_thread_create(waitpid_thread_name, &baton->tid, pty_waitpid, static_cast<void*>(baton), NULL);
-      enif_thread_create(pipesocket_thread_name, &pipesocket->tid, pty_pipesocket_fn, static_cast<void*>(pipesocket), NULL);
+      processes->insert(pipesocket);
+      if (pipe(baton->exit_pipe) != 0) {
+        processes->erase(pipesocket);
+        delete baton;
+        keep_master = false;
+        pty_kill_process_group(pid, SIGKILL);
+        pty_reap(pid);
+        erl_ret = nif::error(env, "Could not create PTY exit wakeup.");
+        goto done;
+      }
+      if (baton->exit_pipe[0] >= FD_SETSIZE || baton->exit_pipe[1] >= FD_SETSIZE ||
+          pty_cloexec(baton->exit_pipe[0]) != 0 || pty_cloexec(baton->exit_pipe[1]) != 0) {
+        close(baton->exit_pipe[0]);
+        close(baton->exit_pipe[1]);
+        processes->erase(pipesocket);
+        delete baton;
+        keep_master = false;
+        pty_kill_process_group(pid, SIGKILL);
+        pty_reap(pid);
+        erl_ret = nif::error(env, "PTY exit wakeup exceeds select capacity.");
+        goto done;
+      }
+      pipesocket->baton = baton;
+      if (enif_thread_create(pipesocket_thread_name, &pipesocket->tid, pty_pipesocket_fn, static_cast<void*>(pipesocket), NULL) != 0) {
+        close(baton->exit_pipe[0]);
+        close(baton->exit_pipe[1]);
+        processes->erase(pipesocket);
+        delete baton;
+        keep_master = false;
+        pty_kill_process_group(pid, SIGKILL);
+        pty_reap(pid);
+        erl_ret = nif::error(env, "Could not start PTY reader.");
+        goto done;
+      }
+      baton->reader_tid = pipesocket->tid;
+      // The waiter retains the registry's resource identity through final reap,
+      // even if the owning Erlang term disappears before the reader returns.
+      enif_keep_resource(pipesocket);
+      if (enif_thread_create(waitpid_thread_name, &baton->tid, pty_waitpid, static_cast<void*>(baton), NULL) != 0) {
+        pty_kill_process_group(pid, SIGKILL);
+        baton->child_exited = true;
+        char wake = 1;
+        while (write(baton->exit_pipe[1], &wake, 1) < 0 && errno == EINTR) {}
+        enif_thread_join(baton->reader_tid, NULL);
+        close(baton->exit_pipe[0]);
+        close(baton->exit_pipe[1]);
+        if (processes->erase(pipesocket)) pty_reap(pid);
+        enif_release_resource(pipesocket);
+        delete baton;
+        erl_ret = nif::error(env, "Could not start PTY waiter.");
+        goto done;
+      }
     }
 done:
     if (restore_signal_mask) {
@@ -514,7 +596,7 @@ static ERL_NIF_TERM expty_kill(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
   int signal = 0;
   if (enif_get_resource(env, argv[0], pty_pipesocket::type, (void **)&pipesocket) && pipesocket &&
       nif::get(env, argv[1], &signal) && signal > 0) {
-    if (pty_kill_process_group(pipesocket->pid, signal) == -1 && errno != ESRCH) {
+    if (processes->signal(pipesocket, signal) == -1 && errno != ESRCH) {
       erl_ret = throw_for_errno(env, "kill() failed: ", errno);
     } else {
       erl_ret = nif::atom(env, "ok");
@@ -659,43 +741,102 @@ pty_pipesocket_fn(void *data) {
 
   int fd = pipesocket->fd;
   int activity;
+  bool draining = false;
+  size_t drained = 0;
+  std::chrono::steady_clock::time_point deadline;
 
   while (!pipesocket->fd_closed) {
+    if (pipesocket->baton->child_exited && !draining) {
+      draining = true;
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    }
+    // Drain buffered and late descendant output until EOF, within one second.
+    // A quiet escaped slave cannot hold completion indefinitely.
+    if (draining && (drained >= 512000 || std::chrono::steady_clock::now() >= deadline)) {
+      pipesocket->baton->drain_failed = true;
+      break;
+    }
     fd_set readfds;
     FD_ZERO(&readfds);
     FD_SET(fd, &readfds);
-    activity = select(fd + 1, &readfds, NULL, NULL, NULL);
+    int wake_fd = pipesocket->baton->exit_pipe[0];
+    if (!draining) FD_SET(wake_fd, &readfds);
+    struct timeval timeout = {0, 0};
+    if (draining) {
+      auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+        deadline - std::chrono::steady_clock::now()).count();
+      if (remaining <= 0) {
+        pipesocket->baton->drain_failed = true;
+        break;
+      }
+      timeout.tv_sec = remaining / 1000000;
+      timeout.tv_usec = remaining % 1000000;
+    }
+    activity = select((fd > wake_fd ? fd : wake_fd) + 1, &readfds, NULL, NULL, draining ? &timeout : NULL);
+    if (activity == 0) {
+      if (draining) {
+        pipesocket->baton->drain_failed = true;
+        break;
+      }
+      continue;
+    }
 
     if (activity < 0) {
       if (errno == EINTR) {
         continue;
       }
+      pipesocket->baton->drain_failed = true;
       pipesocket->fd_closed = true;
       close(fd);
-      pty_kill_process_group(pipesocket->pid, SIGHUP);
+      processes->signal(pipesocket, SIGHUP);
       break;
     }
 
     if (FD_ISSET(fd, &readfds)) {
       const size_t buf_size = 1024;
       char buffer[buf_size] = {'\0'};
-      ssize_t bytes_read = read(fd, buffer, buf_size);
+      size_t read_size = buf_size;
+      if (draining && 512000 - drained < read_size) {
+        read_size = 512000 - drained;
+      }
+      ssize_t bytes_read = read(fd, buffer, read_size);
 
       if (bytes_read == 0) {
         pipesocket->fd_closed = true;
         close(fd);
-        pty_kill_process_group(pipesocket->pid, SIGHUP);
+        processes->signal(pipesocket, SIGHUP);
         break;
       }
       if (bytes_read == -1) {
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
           continue;
         }
+        // Linux PTYs report normal slave closure as EIO.
+        if (errno != EIO) pipesocket->baton->drain_failed = true;
         pipesocket->fd_closed = true;
         close(fd);
-        pty_kill_process_group(pipesocket->pid, SIGHUP);
+        processes->signal(pipesocket, SIGHUP);
         break;
       }
+
+      if (!draining) {
+        // Observe after reading: exit may straddle the syscall. Charge the
+        // whole straddling chunk, then cap later reads to the remaining budget.
+        siginfo_t info = {};
+        int result;
+        do {
+          result = processes->observe_exit(pipesocket, &info);
+        } while (result == -1 && errno == EINTR);
+        if (result == -1) pipesocket->baton->drain_failed = true;
+        if (result == -1 || info.si_pid == pipesocket->pid) {
+          pipesocket->baton->child_exited = true;
+        }
+        if (pipesocket->baton->child_exited) {
+          draining = true;
+          deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        }
+      }
+      if (draining) drained += static_cast<size_t>(bytes_read);
 
       ERL_NIF_TERM dataread;
       unsigned char * ptr;
@@ -714,8 +855,12 @@ pty_pipesocket_fn(void *data) {
     }
   }
 
-  // The reader sends this after its last data message. Process status comes
-  // from a different thread and can arrive before the final output.
+  if (!pipesocket->fd_closed) {
+    pipesocket->fd_closed = true;
+    close(fd);
+  }
+
+  // The waiter joins this reader before sending process status.
   ErlNifEnv *msg_env = enif_alloc_env();
   enif_send(NULL, &pipesocket->process, msg_env, nif::atom(msg_env, "output_closed"));
   enif_free_env(msg_env);
@@ -776,30 +921,57 @@ size_t pty_pipesocket::write(void * data, size_t len) {
 
 /**
  * pty_waitpid
- * Wait for SIGCHLD to read exit status.
+ * Observe original exit, settle the reader, then retire signals and reap.
  */
 
 static void *pty_waitpid(void *data) {
   int ret;
-  int stat_loc;
+  int stat_loc = 0;
 
   pty_baton *baton = static_cast<pty_baton*>(data);
+  pty_pipesocket *pipesocket = baton->pipesocket;
 
-  errno = 0;
-
-  if ((ret = waitpid(baton->pid, &stat_loc, 0)) != baton->pid) {
-    if (ret == -1 && errno == EINTR) {
-      return pty_waitpid(baton);
+  for (;;) {
+    siginfo_t info = {};
+    ret = processes->observe_exit(pipesocket, &info);
+    if (ret == 0 && info.si_pid == baton->pid) break;
+    if (ret == -1 && errno != EINTR) {
+      baton->drain_failed = true;
+      // ECHILD has already retired signal authority under the same lock.
+      // Other observation failures still own a waitable child; settle it.
+      processes->signal(pipesocket, SIGKILL);
+      break;
     }
+    usleep(10000);
   }
 
-  if (WIFEXITED(stat_loc)) {
-    baton->exit_code = WEXITSTATUS(stat_loc); // errno?
-  }
+  baton->child_exited = true;
+  char wake = 1;
+  while (write(baton->exit_pipe[1], &wake, 1) < 0 && errno == EINTR) {}
+  enif_thread_join(baton->reader_tid, NULL);
+  close(baton->exit_pipe[0]);
+  close(baton->exit_pipe[1]);
 
-  if (WIFSIGNALED(stat_loc)) {
+  // Wait for any in-flight signal, then permanently retire this resource's
+  // authority before consuming the original child identity. An old Erlang
+  // resource can never address a later registration that reuses its PID.
+  if (processes->erase(pipesocket)) {
+    do {
+      ret = waitpid(baton->pid, &stat_loc, 0);
+    } while (ret == -1 && errno == EINTR);
+  } else {
+    // An observation already lost custody; never attach to a reused PID.
+    ret = -1;
+  }
+  if (ret != baton->pid) baton->drain_failed = true;
+  if (ret == baton->pid && WIFEXITED(stat_loc)) {
+    baton->exit_code = WEXITSTATUS(stat_loc);
+  }
+  if (ret == baton->pid && WIFSIGNALED(stat_loc)) {
     baton->signal_code = WTERMSIG(stat_loc);
   }
+  // Every data send has completed before this exit send.
+  if (baton->drain_failed) { baton->exit_code = 1; baton->signal_code = 0; }
 
   ErlNifEnv * msg_env = enif_alloc_env();
   enif_send(NULL, &baton->process, msg_env, enif_make_tuple3(msg_env,
@@ -809,14 +981,14 @@ static void *pty_waitpid(void *data) {
   ));
   enif_free_env(msg_env);
 
-  processes->erase(baton->pid);
   delete baton;
+  enif_release_resource(pipesocket);
   return nullptr;
 }
 
 /**
  * pty_pipesocket_dtor
- * Runs once both the reader thread and the owning term are gone.
+ * Runs once native threads and the owning term are gone.
  */
 
 static void pty_pipesocket_dtor(ErlNifEnv *, void *data) {
@@ -845,11 +1017,9 @@ static int pty_kill_process_group(pid_t pid, int signal) {
     errno = ESRCH;
     return -1;
   }
-  int ret = kill(-pid, signal);
-  if (ret == -1 && errno == ESRCH) {
-    ret = kill(pid, signal);
-  }
-  return ret;
+  // A successful spawn-helper handshake establishes this session/group.
+  // Never reinterpret a missing original group as authority over a bare PID.
+  return kill(-pid, signal);
 }
 
 static void pty_reap(pid_t pid) {

@@ -186,14 +186,13 @@ defmodule ExPTY do
   - `drain_on_exit`: `boolean()`
 
     Delay `on_exit` until the PTY reader has closed and its final `on_data`
-    callback has run. Defaults to `false`, which reports process exit without
-    waiting for the reader.
+    callback has run. Defaults to `false`.
 
-    There is no timeout: background descendants that keep the PTY open can
-    delay `on_exit` indefinitely after the spawned process exits. Use the
-    default when prompt exit notification is required, or arrange to terminate
-    the remaining processes independently of `on_exit`. The GenServer remains
-    responsive while waiting for output closure.
+    On Unix, native exit notification always follows reader settlement. After
+    the spawned process exits, the reader drains for at most one second or
+    512,000 bytes. Reaching either limit or failing to establish complete output
+    reports exit code `1` and signal `0`. Background descendants cannot hold
+    completion indefinitely. The GenServer remains responsive while draining.
 
     This option is not supported on Windows.
 

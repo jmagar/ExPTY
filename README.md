@@ -72,15 +72,13 @@ end
 ## Exit callback ordering
 
 On Unix, pass `drain_on_exit: true` to `ExPTY.spawn/3` when `on_exit` must run
-after the final `on_data` callback. The default remains `false`, so existing
-callers receive process exit without waiting for the PTY reader: `on_data`
-may still run after `on_exit`.
+after the final `on_data` callback. The default remains `false`.
 
-Draining has no timeout. Background descendants that keep the PTY open can
-delay `on_exit` indefinitely, even after the spawned process has exited. Use
-the default when you need prompt process exit notification, or arrange to
-terminate the remaining processes independently of `on_exit`. Waiting for
-output closure does not block the GenServer from handling other requests.
+Native Unix exit notification follows reader settlement. Once the spawned
+process exits, draining is limited to one second or 512,000 bytes. Reaching
+either limit or failing to establish complete output reports exit code `1`
+and signal `0`. Background descendants cannot hold completion indefinitely.
+Waiting for output closure does not block the GenServer from handling other requests.
 Windows does not support this option.
 
 Tests build the native library from source. When testing unreleased native
